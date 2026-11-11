@@ -1,49 +1,61 @@
 variable "subscription_id" {
-  description = "Azure subscription ID to deploy into."
+  description = "Azure subscription to deploy into."
   type        = string
-}
-
-variable "resource_group_name" {
-  description = "Name of the existing resource group (<your-resource-group>)."
-  type        = string
-}
-
-variable "location" {
-  description = "Azure region (<permitted-location>). Defaults to the resource group's location when null."
-  type        = string
-  default     = null
-}
-
-variable "storage_account_name" {
-  description = "Globally unique storage account name (<productappstoragename>): 3-24 lowercase letters and digits."
-  type        = string
-
-  validation {
-    condition     = can(regex("^[a-z0-9]{3,24}$", var.storage_account_name))
-    error_message = "storage_account_name must be 3-24 characters, lowercase letters and digits only."
-  }
-}
-
-variable "dist_path" {
-  description = "Path to the built SPA (output of `npm run build`) to upload to $web. Leave empty to skip uploading."
-  type        = string
-  default     = "../dist"
 }
 
 variable "function_app_name" {
-  description = "Existing backend products Function App (<your-backend-products-func>) to add the site to CORS. Leave empty to skip."
+  description = "Existing backend products Function App. Its CORS settings are updated to allow the SPA."
   type        = string
-  default     = ""
 }
 
 variable "function_app_resource_group_name" {
-  description = "Resource group of the Function App. Defaults to resource_group_name when empty."
+  description = "Resource group containing the existing Function App."
   type        = string
-  default     = ""
 }
 
-variable "tags" {
-  description = "Tags applied to created resources."
-  type        = map(string)
-  default     = {}
+# ---------------------------------------------------------------------------
+# Optional: defaults suit the lab, override only if needed.
+# ---------------------------------------------------------------------------
+
+# The length limits below keep the generated storage account name within
+# Azure's 24 characters: project + environment + 6-character suffix + "st".
+variable "project" {
+  description = "Project name, used as the first part of every resource name."
+  type        = string
+  default     = "products"
+
+  validation {
+    condition     = can(regex("^[a-z][a-z0-9-]{0,9}$", var.project))
+    error_message = "Must be 1-10 characters: lowercase letters, digits and hyphens, starting with a letter."
+  }
+}
+
+variable "environment" {
+  description = "Environment name, used as the second part of every resource name, e.g. lab."
+  type        = string
+  default     = "lab"
+
+  validation {
+    condition     = can(regex("^[a-z0-9]{1,6}$", var.environment))
+    error_message = "Must be 1-6 characters: lowercase letters and digits only."
+  }
+}
+
+variable "location" {
+  description = "Azure region for new resources (must be permitted by your subscription's policy)."
+  type        = string
+  default     = "uksouth"
+}
+
+variable "api_base_url" {
+  description = "Base URL of the products API, baked into the SPA. Defaults to https://<function_app_name>.azurewebsites.net/api/ - override if the Function App has a regional hostname."
+  type        = string
+  default     = null
+
+  validation {
+    # The SPA resolves 'products' against this URL, so without the trailing
+    # slash the /api segment would be dropped.
+    condition     = endswith(coalesce(var.api_base_url, "/"), "/")
+    error_message = "Must end with a trailing slash."
+  }
 }

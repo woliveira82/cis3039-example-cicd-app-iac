@@ -1,11 +1,11 @@
-# Copy to terraform.tfvars and fill in your values. Do not commit terraform.tfvars.
-subscription_id      = "00000000-0000-0000-0000-000000000000"
-resource_group_name  = "<your-resource-group>"
-location             = "uksouth" # <permitted-location>; omit to use the resource group's location
-storage_account_name = "productappstoragename"
+subscription_id                  = "00000000-0000-0000-0000-000000000000"
+function_app_name                = "my-backend-products-func"
+function_app_resource_group_name = "my-backend-resource-group"
 
-# Path to the `npm run build` output; set to "" to skip uploading
-dist_path = "../dist"
+# Optional - defaults shown:
+# project     = "products"
+# environment = "dev"
+location    = "uksouth"
 
-# Existing backend Function App to allow CORS from the site; set to "" to skip
-function_app_name = "<your-backend-products-func>"
+# Only needed if the Function App doesn't use <name>.azurewebsites.net:
+# api_base_url = "https://my-func-abc123.uksouth-01.azurewebsites.net/api/"

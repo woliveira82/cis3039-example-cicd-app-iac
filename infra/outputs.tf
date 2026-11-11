@@ -1,14 +1,19 @@
+output "resource_group_name" {
+  description = "Generated resource group name."
+  value       = azurerm_resource_group.this.name
+}
+
 output "storage_account_name" {
-  description = "Name of the static site storage account."
-  value       = azurerm_storage_account.app.name
+  description = "Generated storage account name."
+  value       = azurerm_storage_account.web.name
 }
 
-output "web_endpoint" {
-  description = "URL of the static website (equivalent to `az storage account show --query primaryEndpoints.web`)."
-  value       = azurerm_storage_account.app.primary_web_endpoint
+output "website_url" {
+  description = "Public URL of the deployed SPA."
+  value       = azurerm_storage_account.web.primary_web_endpoint
 }
 
-output "uploaded_file_count" {
-  description = "Number of files uploaded from dist_path to $web."
-  value       = length(azurerm_storage_blob.dist)
+output "api_base_url" {
+  description = "API base URL baked into the SPA."
+  value       = local.api_base_url
 }

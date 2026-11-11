@@ -1,95 +1,123 @@
-data "azurerm_resource_group" "rg" {
-  name = var.resource_group_name
+# Keeps the globally unique storage account name from clashing. Stored in
+# state, so it stays the same across applies.
+resource "random_string" "suffix" {
+  length  = 6
+  upper   = false
+  special = false
 }
 
 locals {
-  location = coalesce(var.location, data.azurerm_resource_group.rg.location)
+  # Follows our naming convention, e.g. products-lab-x7k2qm-rg.
+  name_prefix = "${var.project}-${var.environment}-${random_string.suffix.result}"
 
-  # Files produced by `npm run build`; empty when dist_path is unset or not built yet.
-  dist_files = var.dist_path == "" ? toset([]) : fileset(var.dist_path, "**")
+  # Storage account names allow only lowercase letters and digits, 3-24 characters.
+  storage_account_name = "${replace(local.name_prefix, "-", "")}st"
 
-  mime_types = {
-    html  = "text/html"
-    css   = "text/css"
-    js    = "application/javascript"
-    mjs   = "application/javascript"
-    json  = "application/json"
-    map   = "application/json"
-    svg   = "image/svg+xml"
-    png   = "image/png"
-    jpg   = "image/jpeg"
-    jpeg  = "image/jpeg"
-    gif   = "image/gif"
-    webp  = "image/webp"
-    ico   = "image/x-icon"
-    txt   = "text/plain"
-    woff  = "font/woff"
-    woff2 = "font/woff2"
-    ttf   = "font/ttf"
-  }
+  repo_root = abspath("${path.module}/..")
 
-  # Static website endpoint without trailing slash, e.g. https://<name>.z33.web.core.windows.net
-  web_origin = trimsuffix(azurerm_storage_account.app.primary_web_endpoint, "/")
+  api_base_url = coalesce(var.api_base_url, "https://${var.function_app_name}.azurewebsites.net/api/")
 
-  function_app_rg = var.function_app_resource_group_name != "" ? var.function_app_resource_group_name : var.resource_group_name
+  # CORS origins must not have the trailing slash the endpoint is reported with.
+  web_origin = trimsuffix(azurerm_storage_account.web.primary_web_endpoint, "/")
+
+  # Everything that affects the build output, so the SPA republishes on change.
+  app_source_files = sort(setunion(
+    fileset(local.repo_root, "src/**"),
+    fileset(local.repo_root, "public/**"),
+    ["index.html", "package-lock.json", "vite.config.ts"],
+  ))
+  app_source_hash = sha256(join("", [for f in local.app_source_files : filesha256("${local.repo_root}/${f}")]))
 }
 
-# 1. Storage Account suited for static sites
-resource "azurerm_storage_account" "app" {
-  name                     = var.storage_account_name
-  resource_group_name      = data.azurerm_resource_group.rg.name
-  location                 = local.location
-  account_kind             = "StorageV2"
-  account_tier             = "Standard"
-  account_replication_type = "LRS"
-  min_tls_version          = "TLS1_2"
-  tags                     = var.tags
+resource "azurerm_resource_group" "this" {
+  name     = "${local.name_prefix}-rg"
+  location = var.location
 }
 
-# 2. Enable static website (SPA: 404 falls back to index.html for client-side routing)
-resource "azurerm_storage_account_static_website" "app" {
-  storage_account_id = azurerm_storage_account.app.id
+# ---------------------------------------------------------------------------
+# Static website hosting
+# ---------------------------------------------------------------------------
+
+resource "azurerm_storage_account" "web" {
+  name                            = local.storage_account_name
+  resource_group_name             = azurerm_resource_group.this.name
+  location                        = azurerm_resource_group.this.location
+  account_kind                    = "StorageV2"
+  account_tier                    = "Standard"
+  account_replication_type        = "LRS"
+  min_tls_version                 = "TLS1_2"
+  allow_nested_items_to_be_public = false
+}
+
+resource "azurerm_storage_account_static_website" "web" {
+  storage_account_id = azurerm_storage_account.web.id
   index_document     = "index.html"
+  # The SPA uses history-mode routing, so unknown paths must serve the app.
   error_404_document = "index.html"
 }
 
-# 3. Upload the built SPA to the $web container
-resource "azurerm_storage_blob" "dist" {
-  for_each = local.dist_files
+# ---------------------------------------------------------------------------
+# Backend CORS
+#
+# The Function App is managed outside this configuration, so its CORS list is
+# edited with the Azure CLI rather than by owning the resource here.
+# ---------------------------------------------------------------------------
 
-  name                 = each.value
-  storage_container_id = "${azurerm_storage_account.app.id}/blobServices/default/containers/$web"
-  type                 = "Block"
-  source               = "${var.dist_path}/${each.value}"
-  content_md5          = filemd5("${var.dist_path}/${each.value}")
-  content_type = lookup(
-    local.mime_types,
-    lower(element(split(".", each.value), length(split(".", each.value)) - 1)),
-    "application/octet-stream"
-  )
+resource "terraform_data" "function_app_cors" {
+  triggers_replace = {
+    subscription_id     = var.subscription_id
+    resource_group_name = var.function_app_resource_group_name
+    function_app_name   = var.function_app_name
+    origin              = local.web_origin
+  }
 
-  depends_on = [azurerm_storage_account_static_website.app]
+  provisioner "local-exec" {
+    command = "az functionapp cors add --subscription ${self.triggers_replace.subscription_id} --resource-group ${self.triggers_replace.resource_group_name} --name ${self.triggers_replace.function_app_name} --allowed-origins ${self.triggers_replace.origin}"
+  }
+
+  provisioner "local-exec" {
+    when = destroy
+    # Don't block a destroy if the Function App has already gone.
+    on_failure = continue
+    command    = "az functionapp cors remove --subscription ${self.triggers_replace.subscription_id} --resource-group ${self.triggers_replace.resource_group_name} --name ${self.triggers_replace.function_app_name} --allowed-origins ${self.triggers_replace.origin}"
+  }
 }
 
-# 4. Add the storage site to CORS on the existing backend Function App.
-# The Function App is managed elsewhere, so the origin is added/removed via the Azure CLI
-# (same command as the README) instead of taking ownership of the whole site config.
-resource "terraform_data" "function_cors" {
-  count = var.function_app_name == "" ? 0 : 1
+# ---------------------------------------------------------------------------
+# Build and publish the SPA
+#
+# Vite bakes VITE_* variables in at build time, so the build runs here with
+# the API URL set, and again whenever the source or the URL changes.
+# ---------------------------------------------------------------------------
 
-  input = {
-    function_app   = var.function_app_name
-    resource_group = local.function_app_rg
-    origin         = local.web_origin
+resource "terraform_data" "publish_app" {
+  triggers_replace = {
+    source_hash = local.app_source_hash
+    api_url     = local.api_base_url
+    # Recreating the account or website config empties $web.
+    website = azurerm_storage_account_static_website.web.id
   }
 
   provisioner "local-exec" {
-    command = "az functionapp cors add --name '${self.input.function_app}' --resource-group '${self.input.resource_group}' --allowed-origins '${self.input.origin}'"
-  }
+    working_dir = local.repo_root
+    interpreter = ["bash", "-c"]
 
-  provisioner "local-exec" {
-    when       = destroy
-    on_failure = continue
-    command    = "az functionapp cors remove --name '${self.input.function_app}' --resource-group '${self.input.resource_group}' --allowed-origins '${self.input.origin}'"
+    environment = {
+      # Process variables take priority over any .env.local file.
+      VITE_API_BASE_URL = local.api_base_url
+    }
+
+    command = <<-EOT
+      set -euo pipefail
+      npm ci
+      npm run build
+      az storage blob upload-batch \
+        --subscription ${var.subscription_id} \
+        --account-name ${azurerm_storage_account.web.name} \
+        --auth-mode key \
+        --source ./dist \
+        --destination '$web' \
+        --overwrite
+    EOT
   }
 }
