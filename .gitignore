@@ -32,3 +32,29 @@ coverage
 
 # Vitest
 __screenshots__/
+
+# Environment files (keep .env.example)
+.env
+.env.*
+!.env.example
+
+# Terraform
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraform.tfstate.lock.info
+.terraformrc
+terraform.rc
+
+# Azure Functions / local tooling
+.azure/
