@@ -1,8 +1,3 @@
-variable "subscription_id" {
-  description = "Azure subscription to deploy into."
-  type        = string
-}
-
 variable "function_app_name" {
   description = "Existing backend products Function App. Its CORS settings are updated to allow the SPA."
   type        = string
@@ -16,6 +11,12 @@ variable "function_app_resource_group_name" {
 # ---------------------------------------------------------------------------
 # Optional: defaults suit the lab, override only if needed.
 # ---------------------------------------------------------------------------
+
+variable "subscription_id" {
+  description = "Azure subscription to deploy into (see `az account show`). Leave null to use the current az CLI subscription."
+  type        = string
+  default     = null
+}
 
 # The length limits below keep the generated storage account name within
 # Azure's 24 characters: project + environment + 6-character suffix + "st".

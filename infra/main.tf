@@ -6,7 +6,13 @@ resource "random_string" "suffix" {
   special = false
 }
 
+# Resolves the subscription actually in use, so the az CLI commands below
+# target the same one when subscription_id is left null.
+data "azurerm_client_config" "current" {}
+
 locals {
+  subscription_id = data.azurerm_client_config.current.subscription_id
+
   # Follows our naming convention, e.g. products-lab-x7k2qm-rg.
   name_prefix = "${var.project}-${var.environment}-${random_string.suffix.result}"
 
@@ -65,7 +71,7 @@ resource "azurerm_storage_account_static_website" "web" {
 
 resource "terraform_data" "function_app_cors" {
   triggers_replace = {
-    subscription_id     = var.subscription_id
+    subscription_id     = local.subscription_id
     resource_group_name = var.function_app_resource_group_name
     function_app_name   = var.function_app_name
     origin              = local.web_origin
@@ -112,7 +118,7 @@ resource "terraform_data" "publish_app" {
       npm ci
       npm run build
       az storage blob upload-batch \
-        --subscription ${var.subscription_id} \
+        --subscription ${local.subscription_id} \
         --account-name ${azurerm_storage_account.web.name} \
         --auth-mode key \
         --source ./dist \

@@ -1,4 +1,4 @@
-name: Build
+name: Build and Deploy
 
 on:
   push:
@@ -10,7 +10,19 @@ on:
 permissions:
   contents: read
 
+# Never run two Terraform operations against the same state at once.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.head_ref || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: 22
+  TF_VERSION: 1.17.1
+  TF_IN_AUTOMATION: true
+  TF_INPUT: false
+
 jobs:
+  # CI: runs on every push/PR, no Azure access needed.
   build:
     runs-on: ubuntu-latest
 
@@ -19,133 +31,195 @@ jobs:
       VITE_API_BASE_URL: http://localhost:7071/api/
 
     steps:
-      - name: Checkout code
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: ${{ env.NODE_VERSION }}
           cache: npm
 
       - name: Install dependencies
         run: npm ci
 
-      - name: Run type check
+      - name: Type check
         run: npm run type-check
 
-      - name: Build
+      - name: Build (into ./dist)
         run: npm run build
-
-  terraform-validate:
-    runs-on: ubuntu-latest
-
-    defaults:
-      run:
-        working-directory: infra
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
 
       - name: Set up Terraform
         uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
 
-      - name: Check formatting
+      - name: Terraform format check
+        working-directory: infra
         run: terraform fmt -check -recursive
 
-      - name: Init (no backend)
-        run: terraform init -backend=false -input=false
+      - name: Terraform validate
+        working-directory: infra
+        run: |
+          terraform init -backend=false
+          terraform validate
 
-      - name: Validate
-        run: terraform validate
-
-  deploy:
-    # Deploy only from main, never from pull requests.
-    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
-    needs: [build, terraform-validate]
+  # PRs to main: show what the infrastructure change would be.
+  plan:
+    if: github.event_name == 'pull_request' && github.base_ref == 'main' && github.event.pull_request.head.repo.full_name == github.repository
+    needs: build
     runs-on: ubuntu-latest
-    environment: production
-
-    # Never run two applies against the same state at once.
-    concurrency:
-      group: deploy-production
-      cancel-in-progress: false
-
+    # Azure variables and secret come from the "dev" GitHub environment.
+    environment: dev
     permissions:
       contents: read
-      id-token: write # OIDC login to Azure
+    env:
+      # Terraform azurerm provider + backend authenticate as a service principal
+      # with a client secret.
+      ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+      # Never silently fall back to `az login` (not available on the runner).
+      ARM_USE_CLI: false
+      # Inputs for infra/variables.tf.
+      TF_VAR_function_app_name: ${{ vars.FUNCTION_APP_NAME }}
+      TF_VAR_function_app_resource_group_name: ${{ vars.FUNCTION_APP_RESOURCE_GROUP }}
+      TF_VAR_location: ${{ vars.AZURE_LOCATION || 'uksouth' }}
+      # Optional; empty falls back to https://<function_app_name>.azurewebsites.net/api/
+      TF_VAR_api_base_url: ${{ vars.API_BASE_URL }}
 
     defaults:
       run:
         working-directory: infra
 
-    env:
-      # Terraform azurerm provider and backend auth (OIDC, no client secret).
-      ARM_USE_OIDC: 'true'
-      ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
-      ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-      ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      # Terraform input variables.
-      TF_VAR_subscription_id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Check Azure settings are configured
+        run: |
+          missing=0
+          for v in ARM_CLIENT_ID ARM_TENANT_ID ARM_SUBSCRIPTION_ID ARM_CLIENT_SECRET TF_VAR_function_app_name TF_VAR_function_app_resource_group_name; do
+            if [ -z "${!v}" ]; then echo "::error::$v is empty - set the matching variable/secret in the dev environment"; missing=1; fi
+          done
+          exit $missing
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform init
+        run: >
+          terraform init
+          -backend-config="resource_group_name=${{ vars.TFSTATE_RESOURCE_GROUP }}"
+          -backend-config="storage_account_name=${{ vars.TFSTATE_STORAGE_ACCOUNT }}"
+          -backend-config="container_name=${{ vars.TFSTATE_CONTAINER || 'tfstate' }}"
+          -backend-config="key=products-app.tfstate"
+          -backend-config="use_azuread_auth=true"
+
+      - name: Terraform plan
+        run: terraform plan -lock-timeout=5m
+
+  # CD: on main, apply the infrastructure. Terraform also builds the SPA with
+  # the real API URL, uploads it to $web and adds the site to the API's CORS.
+  deploy:
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    # Azure variables and secret come from the "dev" GitHub environment.
+    environment: dev
+    permissions:
+      contents: read
+    env:
+      # Terraform azurerm provider + backend authenticate as a service principal
+      # with a client secret.
+      ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+      # Never silently fall back to `az login` for the provider.
+      ARM_USE_CLI: false
+      # Inputs for infra/variables.tf.
       TF_VAR_function_app_name: ${{ vars.FUNCTION_APP_NAME }}
       TF_VAR_function_app_resource_group_name: ${{ vars.FUNCTION_APP_RESOURCE_GROUP }}
+      TF_VAR_location: ${{ vars.AZURE_LOCATION || 'uksouth' }}
       # Optional; empty falls back to https://<function_app_name>.azurewebsites.net/api/
       TF_VAR_api_base_url: ${{ vars.API_BASE_URL }}
 
+    defaults:
+      run:
+        working-directory: infra
+
     steps:
-      - name: Checkout code
+      - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Check Azure settings are configured
+        run: |
+          missing=0
+          for v in ARM_CLIENT_ID ARM_TENANT_ID ARM_SUBSCRIPTION_ID ARM_CLIENT_SECRET TF_VAR_function_app_name TF_VAR_function_app_resource_group_name; do
+            if [ -z "${!v}" ]; then echo "::error::$v is empty - set the matching variable/secret in the dev environment"; missing=1; fi
+          done
+          exit $missing
 
       # terraform_data.publish_app runs `npm ci` and `npm run build`.
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: ${{ env.NODE_VERSION }}
           cache: npm
 
-      # terraform_data provisioners run `az functionapp cors` and `az storage blob upload-batch`.
-      - name: Azure login
+      # terraform_data provisioners run `az functionapp cors` and
+      # `az storage blob upload-batch`, so the az CLI must be signed in first.
+      - name: Azure login (for az CLI)
         uses: azure/login@v2
         with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          creds: '{"clientId":"${{ vars.AZURE_CLIENT_ID }}","clientSecret":"${{ secrets.AZURE_CLIENT_SECRET }}","subscriptionId":"${{ vars.AZURE_SUBSCRIPTION_ID }}","tenantId":"${{ vars.AZURE_TENANT_ID }}"}'
 
       - name: Set up Terraform
         uses: hashicorp/setup-terraform@v3
         with:
+          terraform_version: ${{ env.TF_VERSION }}
+          # Plain stdout so `terraform output -raw` can be captured.
           terraform_wrapper: false
 
-      # Local runs keep local state; CI needs shared state so the generated
-      # names (random suffix) stay the same between runs.
-      - name: Configure remote state
+      - name: Terraform init
+        run: >
+          terraform init
+          -backend-config="resource_group_name=${{ vars.TFSTATE_RESOURCE_GROUP }}"
+          -backend-config="storage_account_name=${{ vars.TFSTATE_STORAGE_ACCOUNT }}"
+          -backend-config="container_name=${{ vars.TFSTATE_CONTAINER || 'tfstate' }}"
+          -backend-config="key=products-app.tfstate"
+          -backend-config="use_azuread_auth=true"
+
+      - name: Terraform plan
+        run: terraform plan -lock-timeout=5m -out=tfplan
+
+      - name: Terraform apply
+        run: terraform apply -lock-timeout=5m tfplan
+
+      - name: Read Terraform outputs
+        id: tf
         run: |
-          cat > backend_override.tf <<'EOF'
-          terraform {
-            backend "azurerm" {}
-          }
-          EOF
+          echo "website_url=$(terraform output -raw website_url)" >> "$GITHUB_OUTPUT"
+          echo "api_base_url=$(terraform output -raw api_base_url)" >> "$GITHUB_OUTPUT"
+          echo "resource_group_name=$(terraform output -raw resource_group_name)" >> "$GITHUB_OUTPUT"
 
-      - name: Init
+      - name: Smoke test
         run: |
-          terraform init -input=false \
-            -backend-config="resource_group_name=${{ vars.TFSTATE_RESOURCE_GROUP }}" \
-            -backend-config="storage_account_name=${{ vars.TFSTATE_STORAGE_ACCOUNT }}" \
-            -backend-config="container_name=${{ vars.TFSTATE_CONTAINER || 'tfstate' }}" \
-            -backend-config="key=products-app.tfstate"
-
-      - name: Plan
-        run: terraform plan -input=false -out=tfplan
-
-      - name: Apply
-        run: terraform apply -input=false tfplan
-
-      - name: Summary
-        run: |
-          echo "### Deployed" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Website: $(terraform output -raw website_url)" >> "$GITHUB_STEP_SUMMARY"
-          echo "- API: $(terraform output -raw api_base_url)" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Resource group: $(terraform output -raw resource_group_name)" >> "$GITHUB_STEP_SUMMARY"
+          for i in $(seq 1 10); do
+            if curl -fsS -o /dev/null "${{ steps.tf.outputs.website_url }}"; then
+              {
+                echo "### Deployed"
+                echo ""
+                echo "- Website: ${{ steps.tf.outputs.website_url }}"
+                echo "- API: ${{ steps.tf.outputs.api_base_url }}"
+                echo "- Resource group: ${{ steps.tf.outputs.resource_group_name }}"
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "Not ready yet, retrying in 15s..."; sleep 15
+          done
+          echo "Smoke test failed"; exit 1
