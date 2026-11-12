@@ -15,6 +15,7 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
+      # CI check only: the deploy job rebuilds with the real API URL.
       VITE_API_BASE_URL: http://localhost:7071/api/
 
     steps:
@@ -35,3 +36,116 @@ jobs:
 
       - name: Build
         run: npm run build
+
+  terraform-validate:
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: infra
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Check formatting
+        run: terraform fmt -check -recursive
+
+      - name: Init (no backend)
+        run: terraform init -backend=false -input=false
+
+      - name: Validate
+        run: terraform validate
+
+  deploy:
+    # Deploy only from main, never from pull requests.
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: [build, terraform-validate]
+    runs-on: ubuntu-latest
+    environment: production
+
+    # Never run two applies against the same state at once.
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+
+    permissions:
+      contents: read
+      id-token: write # OIDC login to Azure
+
+    defaults:
+      run:
+        working-directory: infra
+
+    env:
+      # Terraform azurerm provider and backend auth (OIDC, no client secret).
+      ARM_USE_OIDC: 'true'
+      ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # Terraform input variables.
+      TF_VAR_subscription_id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      TF_VAR_function_app_name: ${{ vars.FUNCTION_APP_NAME }}
+      TF_VAR_function_app_resource_group_name: ${{ vars.FUNCTION_APP_RESOURCE_GROUP }}
+      # Optional; empty falls back to https://<function_app_name>.azurewebsites.net/api/
+      TF_VAR_api_base_url: ${{ vars.API_BASE_URL }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # terraform_data.publish_app runs `npm ci` and `npm run build`.
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # terraform_data provisioners run `az functionapp cors` and `az storage blob upload-batch`.
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      # Local runs keep local state; CI needs shared state so the generated
+      # names (random suffix) stay the same between runs.
+      - name: Configure remote state
+        run: |
+          cat > backend_override.tf <<'EOF'
+          terraform {
+            backend "azurerm" {}
+          }
+          EOF
+
+      - name: Init
+        run: |
+          terraform init -input=false \
+            -backend-config="resource_group_name=${{ vars.TFSTATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TFSTATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ vars.TFSTATE_CONTAINER || 'tfstate' }}" \
+            -backend-config="key=products-app.tfstate"
+
+      - name: Plan
+        run: terraform plan -input=false -out=tfplan
+
+      - name: Apply
+        run: terraform apply -input=false tfplan
+
+      - name: Summary
+        run: |
+          echo "### Deployed" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Website: $(terraform output -raw website_url)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- API: $(terraform output -raw api_base_url)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Resource group: $(terraform output -raw resource_group_name)" >> "$GITHUB_STEP_SUMMARY"
