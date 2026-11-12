@@ -1,11 +1,13 @@
-subscription_id                  = "00000000-0000-0000-0000-000000000000"
+# Copy to terraform.tfvars and set the two required values.
+
 function_app_name                = "my-backend-products-func"
 function_app_resource_group_name = "my-backend-resource-group"
 
 # Optional - defaults shown:
-# project     = "products"
-# environment = "dev"
-location    = "uksouth"
+# subscription_id = "00000000-0000-0000-0000-000000000000" # default: current az CLI subscription
+# project         = "products"
+# environment     = "lab"
+# location        = "uksouth"
 
 # Only needed if the Function App doesn't use <name>.azurewebsites.net:
 # api_base_url = "https://my-func-abc123.uksouth-01.azurewebsites.net/api/"

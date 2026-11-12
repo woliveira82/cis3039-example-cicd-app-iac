@@ -1,0 +1,9 @@
+# Copy to backend.hcl and run: terraform init -backend-config=backend.hcl
+# Use the same values as the TFSTATE_* GitHub repository variables so local
+# runs and the CI/CD workflow share one state file.
+
+resource_group_name  = "products-lab-tfstate-rg"
+storage_account_name = "<yourtfstateaccount>"
+container_name       = "tfstate"
+key                  = "products-app.tfstate"
+use_azuread_auth     = true
